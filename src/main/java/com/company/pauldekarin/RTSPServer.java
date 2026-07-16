@@ -7,91 +7,210 @@ import java.io.BufferedWriter;
 import java.io.IOException;
 import java.io.InputStreamReader;
 import java.io.OutputStreamWriter;
-import java.lang.foreign.MemorySegment;
-import java.lang.foreign.ValueLayout;
 import java.net.DatagramPacket;
 import java.net.DatagramSocket;
 import java.net.InetAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.nio.file.Files;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
-
+import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.locks.LockSupport;
-import org.jnetpcap.BpFilter;
-import org.jnetpcap.Pcap;
-import org.jnetpcap.PcapException;
-import org.jnetpcap.PcapHandler;
-import org.jnetpcap.PcapHeader;
 
+/**
+ * Serves a pcap capture over RTSP by replaying the RTP it holds.
+ *
+ * <p>What to send is worked out from the capture itself: {@link CaptureAnalyzer} finds the
+ * streams, {@link SdpBuilder} describes them, and {@link ReplayClock} decides when each packet is
+ * due. Nothing about any particular capture is baked in here.
+ */
 public class RTSPServer {
-  DatagramSocket RTPSocket;
 
-  final static int RTSPPort = 5554;
-  final static String CRLF = "\r\n";
+  static final String CRLF = "\r\n";
 
-  static String RTSPid = UUID.randomUUID().toString();
+  private static final int INIT = 0;
+  private static final int READY = 1;
+  private static final int PLAYING = 2;
 
-  final static int INIT = 0;
-  final static int READY = 1;
-  final static int PLAYING = 2;
+  private static final int SETUP = 3;
+  private static final int PLAY = 4;
+  private static final int PAUSE = 5;
+  private static final int TEARDOWN = 6;
+  private static final int DESCRIBE = 7;
+  private static final int OPTIONS = 8;
+  private static final int UNKNOWN = -1;
 
-  final static int SETUP = 3;
-  final static int PLAY = 4;
-  final static int PAUSE = 5;
-  final static int TEARDOWN = 6;
-  final static int DESCRIBE = 7;
-  final static int OPTIONS = 8;
+  private final Options options;
+  private final Capture capture;
+  private final List<RtpTrack> tracks;
+  private final String sdp;
 
-  /** Port the audio track was delivered to in the capture (RTP payload type 96, mpeg4-generic). */
-  final static int CAPTURE_AUDIO_PORT = 49188;
-  /** Port the video track was delivered to in the capture (RTP payload type 97, H264). */
-  final static int CAPTURE_VIDEO_PORT = 49190;
-
-  /** Ethernet (14) + IPv4 (20) + UDP (8) headers sit in front of the RTP payload. */
-  final static int RTP_PAYLOAD_OFFSET = 42;
-  /** UDP destination port sits after Ethernet (14) + IPv4 (20) + the 2-byte source port. */
-  final static int UDP_DST_PORT_OFFSET = 36;
-
-  int RTSPSeqNb = 0;
-  List<Integer> RTPDestPorts;
-
-  static int state = -1;
-
-  Socket RTSPSocket;
-  InetAddress IPAddr;
-  static BufferedReader RTSPBufferedReader;
-  static BufferedWriter RTSPBufferedWriter;
-  final static String PCAP_FILEPATH = System.getProperty("user.dir").concat("/bunny.pcapng");
-
-  static Pcap pcap;
+  /** Where each track's packets went in the capture, against where this client wants them. */
+  private final Map<Integer, Integer> captureToClientPort = new HashMap<>();
 
   private final ReplayClock clock = new ReplayClock();
-  private Thread sender;
+  private final String sessionId = UUID.randomUUID().toString();
 
-  public RTSPServer() {
-    RTPDestPorts = new ArrayList<Integer>();
+  private Socket rtspSocket;
+  private InetAddress clientAddress;
+  private DatagramSocket rtpSocket;
+  private BufferedReader in;
+  private BufferedWriter out;
+
+  private volatile boolean streaming;
+  private Thread sender;
+  private int cSeq;
+  private int state = INIT;
+
+  RTSPServer(Options options, Capture capture, List<RtpTrack> tracks, String sdp) {
+    this.options = options;
+    this.capture = capture;
+    this.tracks = tracks;
+    this.sdp = sdp;
+  }
+
+  public static void main(String[] args) throws Exception {
+    if (args.length == 0 || List.of(args).contains("--help")) {
+      System.out.print(Options.USAGE);
+      return;
+    }
+
+    Options options;
+    Capture capture;
+    List<RtpTrack> tracks;
+    String sdp;
+    try {
+      options = Options.parse(args);
+      capture = Capture.at(options.pcap());
+
+      tracks = capture.findTracks();
+      if (tracks.isEmpty()) {
+        System.err.println("No RTP streams found in " + options.pcap());
+        System.exit(1);
+        return;
+      }
+
+      sdp = options.sdp() != null
+          ? Files.readString(options.sdp())
+          : new SdpBuilder(options.sessionName())
+              .build(tracks, options.encodings(), options.formatParameters());
+    } catch (IllegalArgumentException e) {
+      System.err.println(e.getMessage());
+      System.exit(2);
+      return;
+    }
+
+    describeFindings(tracks);
+    new RTSPServer(options, capture, tracks, sdp).serve();
+  }
+
+  /** Reports what the capture holds, so a surprise is visible before a client trips over it. */
+  private static void describeFindings(List<RtpTrack> tracks) {
+    System.out.println("Found " + tracks.size() + " RTP stream(s):");
+    for (int i = 0; i < tracks.size(); i++) {
+      RtpTrack track = tracks.get(i);
+      System.out.printf("  trackID=%d  port %d  payload type %d  ssrc %d  %d packets%n",
+          i + 1, track.port(), track.payloadType(), track.ssrc(), track.packetCount());
+    }
+  }
+
+  /** Accepts one RTSP session and answers requests until the client tears it down. */
+  void serve() throws IOException {
+    try (ServerSocket listener = new ServerSocket(options.port())) {
+      System.out.println("Serving rtsp://localhost:" + options.port() + "/" + options.sessionName());
+      rtspSocket = listener.accept();
+    }
+
+    clientAddress = rtspSocket.getInetAddress();
+    in = new BufferedReader(new InputStreamReader(rtspSocket.getInputStream(), US_ASCII));
+    out = new BufferedWriter(new OutputStreamWriter(rtspSocket.getOutputStream(), US_ASCII));
+
+    boolean done = false;
+    while (!done) {
+      Request request = readRequest();
+      if (request == null) {
+        break; // the client went away without a TEARDOWN
+      }
+      done = handle(request);
+    }
+
+    stopStreaming();
+    close(rtspSocket);
+    if (rtpSocket != null) {
+      rtpSocket.close();
+    }
+  }
+
+  /** Answers one request. Returns true once the session is over. */
+  private boolean handle(Request request) throws IOException {
+    switch (request.method()) {
+      case OPTIONS -> respond("Public: DESCRIBE, SETUP, TEARDOWN, PLAY, PAUSE, OPTIONS");
+      case DESCRIBE -> respondWithDescription();
+      case SETUP -> setUp(request);
+      case PLAY -> {
+        if (state == READY) {
+          respond();
+          startStreaming();
+          state = PLAYING;
+        }
+      }
+      case PAUSE -> {
+        if (state == PLAYING) {
+          respond();
+          stopStreaming();
+          state = READY;
+        }
+      }
+      case TEARDOWN -> {
+        respond();
+        return true;
+      }
+      default -> { /* not something we serve */ }
+    }
+    return false;
   }
 
   /**
-   * Streams the capture on a background thread until the replay ends or {@link #stopStreaming()}
-   * interrupts it. Reading packets has to leave the RTSP thread free to accept PAUSE and TEARDOWN
-   * while playback is under way.
+   * Binds one of the capture's tracks to the port this client wants it on.
+   *
+   * <p>The track comes from the SETUP's control URL rather than from the order SETUPs arrive in,
+   * so a client that sets its tracks up out of order still gets each stream on the right port.
    */
+  private void setUp(Request request) throws IOException {
+    int trackId = RtspHeaders.trackId(request.line());
+    int clientPort = RtspHeaders.clientPort(request.headers());
+
+    if (trackId < 1 || trackId > tracks.size() || clientPort < 0) {
+      respondWith("RTSP/1.0 455 Method Not Valid In This State", "");
+      return;
+    }
+
+    if (rtpSocket == null) {
+      rtpSocket = new DatagramSocket();
+    }
+    captureToClientPort.put(tracks.get(trackId - 1).port(), clientPort);
+
+    respond("Transport: RTP/AVP;unicast;client_port=" + clientPort + CRLF
+        + "Session: " + sessionId + ";timeout=60");
+    state = READY;
+  }
+
   private void startStreaming() {
     clock.reset();
-    sender = new Thread(() -> pcap.loop(-1, this::replayPacket, "rtp"), "rtp-sender");
+    streaming = true;
+    sender = new Thread(this::replay, "rtp-sender");
     sender.setDaemon(true);
     sender.start();
   }
 
-  /** Stops the replay and waits for the sender to settle, leaving the capture where it stopped. */
   private void stopStreaming() {
+    streaming = false;
     if (sender == null) {
       return;
     }
-    pcap.breakloop();
     try {
       sender.join(1_000);
     } catch (InterruptedException e) {
@@ -100,228 +219,121 @@ public class RTSPServer {
     sender = null;
   }
 
-  /**
-   * Releases one captured packet at the point in time the capture says it belongs, then forwards
-   * its RTP payload to the port the client negotiated for that track.
-   */
-  private void replayPacket(String user, MemorySegment header, MemorySegment packet) {
+  /** Reads the capture on its own thread so PAUSE and TEARDOWN stay answerable while it plays. */
+  private void replay() {
     try {
-      PcapHeader pcapHeader = new PcapHeader(header);
-      long capturedAtMicros = ReplayClock.toMicros(pcapHeader.tvSec(), pcapHeader.tvUsec());
-
-      long waitNanos = clock.delayNanosFor(capturedAtMicros, System.nanoTime());
-      if (waitNanos > 0) {
-        LockSupport.parkNanos(waitNanos);
-      }
-
-      int destPort = destPortFor(extractPortUDP(packet));
-      byte[] payload = packet.asSlice(RTP_PAYLOAD_OFFSET).toArray(ValueLayout.JAVA_BYTE);
-
-      RTPSocket.send(new DatagramPacket(payload, payload.length, IPAddr, destPort));
+      capture.replay(this::sendFrame, () -> streaming);
     } catch (Exception e) {
-      // The client hung up, or the capture holds a frame we cannot read. Either way this replay
-      // is over; unwind the loop instead of killing the JVM.
-      pcap.breakloop();
+      System.err.println("replay stopped: " + e.getMessage());
     }
+  }
+
+  /** Waits until the frame is due, then forwards its RTP to the port the client asked for. */
+  private void sendFrame(byte[] frame, long capturedAtMicros) {
+    UdpFrame udp = UdpFrame.parse(frame);
+    if (udp == null) {
+      return;
+    }
+
+    Integer clientPort = captureToClientPort.get(udp.destinationPort());
+    if (clientPort == null) {
+      return; // a stream this client never set up, or not media at all
+    }
+
+    long waitNanos = clock.delayNanosFor(capturedAtMicros, System.nanoTime());
+    if (waitNanos > 0) {
+      LockSupport.parkNanos(waitNanos);
+    }
+
+    byte[] payload = new byte[udp.payloadLength()];
+    System.arraycopy(frame, udp.payloadOffset(), payload, 0, payload.length);
+
+    try {
+      rtpSocket.send(new DatagramPacket(payload, payload.length, clientAddress, clientPort));
+    } catch (IOException e) {
+      streaming = false; // the client is gone; unwind rather than shout about every packet
+    }
+  }
+
+  private void respondWithDescription() throws IOException {
+    respondWith("RTSP/1.0 200 OK",
+        "Content-Base: rtsp://localhost:" + options.port() + "/" + options.sessionName() + "/" + CRLF
+            + "Content-Type: application/sdp" + CRLF
+            + "Content-Length: " + sdp.getBytes(US_ASCII).length,
+        sdp);
+  }
+
+  private void respond() throws IOException {
+    respond("");
+  }
+
+  private void respond(String headers) throws IOException {
+    respondWith("RTSP/1.0 200 OK", headers);
+  }
+
+  private void respondWith(String status, String headers) throws IOException {
+    respondWith(status, headers, "");
   }
 
   /**
-   * Maps a track's port in the capture onto the RTP port the client asked for. The SDP announces
-   * audio first, so the client sets audio up first and its port lands at the head of the list.
+   * Writes one response. {@code headers} holds extra header lines with no trailing terminator; the
+   * blank line that ends the header block is added here, exactly once.
    */
-  private int destPortFor(int capturedDstPort) {
-    if (capturedDstPort == CAPTURE_VIDEO_PORT) {
-      return RTPDestPorts.get(RTPDestPorts.size() - 1);
+  private void respondWith(String status, String headers, String body) throws IOException {
+    out.write(status + CRLF);
+    out.write("CSeq: " + cSeq + CRLF);
+    out.write("Server: rtsp-pcap-server" + CRLF);
+    out.write("Cache-Control: no-cache" + CRLF);
+    out.write("Session: " + sessionId + ";timeout=60" + CRLF);
+    if (!headers.isEmpty()) {
+      out.write(headers + CRLF);
     }
-    return RTPDestPorts.get(0);
-  }
-
-  static public void main(String[] args) throws IOException, PcapException {
-    RTSPServer rtspServer = new RTSPServer();
-
-    pcap = Pcap.openOffline(PCAP_FILEPATH);
-
-    BpFilter filter = pcap.compile("udp", true);
-    pcap.setFilter(filter);
-
-    ServerSocket masterSocket = new ServerSocket(RTSPPort);
-    rtspServer.RTSPSocket = masterSocket.accept();
-    masterSocket.close();
-
-    rtspServer.IPAddr = rtspServer.RTSPSocket.getInetAddress();
-
-    RTSPBufferedReader =
-        new BufferedReader(new InputStreamReader(rtspServer.RTSPSocket.getInputStream()));
-    RTSPBufferedWriter =
-        new BufferedWriter(new OutputStreamWriter(rtspServer.RTSPSocket.getOutputStream()));
-
-    state = INIT;
-
-    int reqType;
-    boolean done = false;
-
-    while (!done) {
-      reqType = rtspServer.parseRTSPRequest();
-
-      if (reqType == OPTIONS) {
-        rtspServer.sendResponse("Public: DESCRIBE, SETUP, TEARDOWN, PLAY, PAUSE, OPTIONS");
-      } else if (reqType == DESCRIBE) {
-        rtspServer.sendDescribe();
-      } else if (reqType == SETUP) {
-        if (rtspServer.RTPSocket == null) {
-          rtspServer.RTPSocket = new DatagramSocket();
-        }
-        // Header block only: sendResponse adds the blank line that ends it.
-        String resp = "Transport: RTP/AVP;unicast;client_port="
-            + Integer.toString(rtspServer.RTPDestPorts.getLast()) + CRLF + "Session: " + RTSPid
-            + ";timeout=60";
-        rtspServer.sendResponse(resp);
-
-        state = READY;
-      } else if (reqType == PLAY) {
-        if (state == READY) {
-          rtspServer.sendResponse();
-          rtspServer.startStreaming();
-
-          state = PLAYING;
-        }
-      } else if (reqType == TEARDOWN) {
-        rtspServer.sendResponse();
-        rtspServer.stopStreaming();
-        rtspServer.RTSPSocket.close();
-        rtspServer.RTPSocket.close();
-        done = true;
-      } else if (reqType == PAUSE) {
-        if (state == PLAYING) {
-          rtspServer.sendResponse();
-          rtspServer.stopStreaming();
-          state = READY;
-        }
-      }
+    out.write(CRLF);
+    if (!body.isEmpty()) {
+      out.write(body);
     }
+    out.flush();
   }
 
-  /** Reads the UDP destination port, which the capture stores big-endian. */
-  public static int extractPortUDP(MemorySegment packet) {
-    return Short.toUnsignedInt(
-        Short.reverseBytes(packet.asSlice(UDP_DST_PORT_OFFSET, 2).get(ValueLayout.JAVA_SHORT, 0)));
-  }
-  private static void displayMemorySegment(MemorySegment seg) {
-    StringBuilder hexBuilder = new StringBuilder();
-    Integer hexCount = 0;
-    for (byte b : seg.toArray(ValueLayout.JAVA_BYTE)) {
-      hexBuilder.append(String.format("%02x ", b));
-      if (hexCount++ >= 15) {
-        hexBuilder.append('\n');
-        hexCount = 0;
-      }
+  /** Reads one request, or returns {@code null} if the client closed the connection. */
+  private Request readRequest() throws IOException {
+    String requestLine = in.readLine();
+    if (requestLine == null) {
+      return null;
     }
-    System.out.println(hexBuilder.toString());
+    if (requestLine.isEmpty()) {
+      return new Request(UNKNOWN, "", List.of());
+    }
+
+    List<String> headers = new ArrayList<>();
+    for (String line = in.readLine(); line != null && !line.isEmpty(); line = in.readLine()) {
+      headers.add(line);
+    }
+
+    cSeq = RtspHeaders.cSeq(headers);
+    return new Request(methodCodeOf(requestLine), requestLine, headers);
   }
 
-  private void sendResponse() {
+  private static int methodCodeOf(String requestLine) {
+    return switch (RtspHeaders.method(requestLine)) {
+      case "SETUP" -> SETUP;
+      case "PLAY" -> PLAY;
+      case "PAUSE" -> PAUSE;
+      case "TEARDOWN" -> TEARDOWN;
+      case "DESCRIBE" -> DESCRIBE;
+      case "OPTIONS" -> OPTIONS;
+      default -> UNKNOWN;
+    };
+  }
+
+  private static void close(Socket socket) {
     try {
-      RTSPBufferedWriter.write("RTSP/1.0 200 OK" + CRLF);
-      RTSPBufferedWriter.write("CSeq: " + RTSPSeqNb + CRLF);
-      RTSPBufferedWriter.write("Server: localhost" + CRLF);
-      RTSPBufferedWriter.write("Cache: no-cache" + CRLF);
-      RTSPBufferedWriter.write("Session: " + RTSPid + CRLF);
-      RTSPBufferedWriter.write(CRLF);
-      RTSPBufferedWriter.flush();
+      socket.close();
     } catch (IOException e) {
-    }
-  }
-  private void sendResponse(String msg) {
-    try {
-      RTSPBufferedWriter.write("RTSP/1.0 200 OK" + CRLF);
-      RTSPBufferedWriter.write("CSeq: " + RTSPSeqNb + CRLF);
-      RTSPBufferedWriter.write("Server: localhost" + CRLF);
-      RTSPBufferedWriter.write("Cache: no-cache" + CRLF);
-      RTSPBufferedWriter.write(msg + CRLF);
-      RTSPBufferedWriter.write(CRLF);
-      RTSPBufferedWriter.flush();
-    } catch (IOException e) {
+      // closing on the way out; nothing left to do about it
     }
   }
 
-  /**
-   * Describes the two tracks held in the capture. The parameters below are the ones the original
-   * stream was encoded with, so they have to match the packets that get replayed.
-   *
-   * <p>Audio is announced first, which is what makes the client set it up first and lets
-   * {@link #destPortFor(int)} tell the two tracks apart by the order of their SETUPs.
-   */
-  private void sendDescribe() {
-    String sdp = "v=0" + CRLF + "o=- 1823687535 1823687535 IN IP4 127.0.0.1" + CRLF
-        + "s=BigBuckBunny_115k.mov" + CRLF + "c=IN IP4 127.0.0.1" + CRLF + "t=0 0" + CRLF
-        + "a=sdplang:en" + CRLF + "a=range:npt=0- 596.48" + CRLF + "a=control:*" + CRLF
-        + "m=audio 0 RTP/AVP 96" + CRLF + "a=rtpmap:96 mpeg4-generic/12000/2" + CRLF
-        + "a=fmtp:96 profile-level-id=1;mode=AAC-hbr;sizelength=13;indexlength=3;indexdeltalength=3;config=1490"
-        + CRLF + "a=control:trackID=1" + CRLF + "m=video 0 RTP/AVP 97" + CRLF
-        + "a=rtpmap:97 H264/90000" + CRLF
-        + "a=fmtp:97 packetization-mode=1;profile-level-id=42C01E;sprop-parameter-sets=Z0LAHtkDxWhAAAADAEAAAAwDxYuS,aMuMsg=="
-        + CRLF + "a=cliprect:0,0,160,240" + CRLF + "a=framesize:97 240-160" + CRLF
-        + "a=framerate:24.0" + CRLF + "a=control:trackID=2" + CRLF;
-
-    try {
-      RTSPBufferedWriter.write("RTSP/1.0 200 OK" + CRLF);
-      RTSPBufferedWriter.write("CSeq: " + RTSPSeqNb + CRLF);
-      RTSPBufferedWriter.write("Server: rtsp-pcap-server" + CRLF);
-      RTSPBufferedWriter.write("Cache-Control: no-cache" + CRLF);
-      RTSPBufferedWriter.write("Session: " + RTSPid + ";timeout=60" + CRLF);
-      RTSPBufferedWriter.write("Content-Base: rtsp://localhost:" + RTSPPort + "/bunny/" + CRLF);
-      RTSPBufferedWriter.write("Content-Type: application/sdp" + CRLF);
-      RTSPBufferedWriter.write("Content-Length: " + sdp.getBytes(US_ASCII).length + CRLF);
-      RTSPBufferedWriter.write(CRLF);
-      RTSPBufferedWriter.write(sdp);
-      RTSPBufferedWriter.flush();
-    } catch (IOException ex) {
-      ex.printStackTrace();
-    }
-  }
-  private int parseRTSPRequest() {
-    int reqType = -1;
-    try {
-      String RequestLine = RTSPBufferedReader.readLine();
-
-      if (RequestLine == null || RequestLine.isEmpty())
-        return reqType;
-      System.out.println("*".repeat(10));
-      System.out.println("[\033[32mRequestLine\033[0m]: " + RequestLine);
-
-      reqType = switch (RtspHeaders.method(RequestLine)) {
-        case "SETUP" -> SETUP;
-        case "PLAY" -> PLAY;
-        case "PAUSE" -> PAUSE;
-        case "TEARDOWN" -> TEARDOWN;
-        case "DESCRIBE" -> DESCRIBE;
-        case "OPTIONS" -> OPTIONS;
-        default -> -1;
-      };
-
-      // Read the whole header block first: RFC 2326 fixes no order, so nothing can be
-      // read off a line number.
-      List<String> headers = new ArrayList<>();
-      for (String line = RTSPBufferedReader.readLine();
-          line != null && !line.isEmpty();
-          line = RTSPBufferedReader.readLine()) {
-        headers.add(line);
-        System.out.println("[\033[32mheader\033[0m]: " + line);
-      }
-
-      RTSPSeqNb = RtspHeaders.cSeq(headers);
-
-      if (reqType == SETUP) {
-        int clientPort = RtspHeaders.clientPort(headers);
-        if (clientPort > 0) {
-          RTPDestPorts.add(clientPort);
-        }
-      }
-      System.out.println("*".repeat(10));
-
-    } catch (IOException e) {
-      return -1;
-    }
-    return (reqType);
-  }
+  /** One parsed RTSP request. */
+  private record Request(int method, String line, List<String> headers) {}
 }

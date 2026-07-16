@@ -61,4 +61,25 @@ class RtspHeadersTest {
   void toleratesBlankRequestLine() {
     assertEquals("", RtspHeaders.method("   "));
   }
+
+  @Test
+  void readsTheTrackIdASetupIsAskingFor() {
+    // the client SETUPs the control URL the SDP handed it, one track at a time
+    assertEquals(2, RtspHeaders.trackId("SETUP rtsp://localhost:5554/bunny/trackID=2 RTSP/1.0"));
+  }
+
+  @Test
+  void readsATrackIdFollowedByTheProtocolVersion() {
+    assertEquals(1, RtspHeaders.trackId("SETUP rtsp://host/x/trackID=1 RTSP/1.0"));
+  }
+
+  @Test
+  void reportsNoTrackIdWhenTheUrlCarriesNone() {
+    assertEquals(-1, RtspHeaders.trackId("PLAY rtsp://localhost:5554/bunny RTSP/1.0"));
+  }
+
+  @Test
+  void matchesTrackIdCaseInsensitively() {
+    assertEquals(3, RtspHeaders.trackId("SETUP rtsp://host/x/TrackID=3 RTSP/1.0"));
+  }
 }

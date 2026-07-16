@@ -15,6 +15,7 @@ final class RtspHeaders {
 
   private static final String CSEQ = "cseq:";
   private static final String CLIENT_PORT = "client_port=";
+  private static final String TRACK_ID = "trackid=";
 
   private RtspHeaders() {}
 
@@ -27,6 +28,30 @@ final class RtspHeaders {
 
     int firstSpace = trimmed.indexOf(' ');
     return firstSpace < 0 ? trimmed : trimmed.substring(0, firstSpace);
+  }
+
+  /**
+   * Returns the track a SETUP is for, taken from the control URL the SDP handed the client, or
+   * {@code -1} if the URL names none.
+   *
+   * <p>Asking the URL is what makes a track's identity explicit. The alternative — assuming
+   * clients SETUP in the order the SDP announced — holds for every client until it doesn't.
+   */
+  static int trackId(String requestLine) {
+    int start = requestLine.toLowerCase().indexOf(TRACK_ID);
+    if (start < 0) {
+      return -1;
+    }
+
+    String value = requestLine.substring(start + TRACK_ID.length());
+    int end = 0;
+    while (end < value.length() && Character.isDigit(value.charAt(end))) {
+      end++;
+    }
+    if (end == 0) {
+      return -1;
+    }
+    return Integer.parseInt(value.substring(0, end));
   }
 
   /** Returns the {@code CSeq} of the request, or {@code 0} when the client omitted it. */
